@@ -77,6 +77,7 @@ function Feed (createStorage, key, opts) {
   this._storage = storage(createStorage, opts.storageCacheSize)
   this._batch = batcher(this._onwrite ? workHook : work)
 
+  this._seq = 0
   this._waiting = []
   this._selections = []
   this._reserved = sparseBitfield()
@@ -94,10 +95,12 @@ function Feed (createStorage, key, opts) {
   }
 
   function workHook (values, cb) {
+    if (!self._merkle) return self._reloadMerkleStateBeforeAppend(workHook, values, cb)
     self._appendHook(values, cb)
   }
 
   function work (values, cb) {
+    if (!self._merkle) return self._reloadMerkleStateBeforeAppend(work, values, cb)
     self._append(values, cb)
   }
 
@@ -192,13 +195,25 @@ Feed.prototype._writeStateReloader = function (cb) {
   var self = this
   return function (err) {
     if (err) return cb(err)
-
-    self._roots(self.length, function (err, roots) {
-      if (err) return cb(err)
-      self._merkle = merkle(crypto, roots)
-      cb(null)
-    })
+    self._reloadMerkleState(cb)
   }
+}
+
+Feed.prototype._reloadMerkleState = function (cb) {
+  var self = this
+
+  this._roots(self.length, function (err, roots) {
+    if (err) return cb(err)
+    self._merkle = merkle(crypto, roots)
+    cb(null)
+  })
+}
+
+Feed.prototype._reloadMerkleStateBeforeAppend = function (work, values, cb) {
+  this._reloadMerkleState(function (err) {
+    if (err) return cb(err)
+    work(values, cb)
+  })
 }
 
 Feed.prototype._open = function (cb) {
@@ -237,6 +252,7 @@ Feed.prototype._open = function (cb) {
     self.bitfield = bitfield(state.bitfield)
     self.tree = treeIndex(self.bitfield.tree)
     self.length = self.tree.blocks()
+    self._seq = self.length
 
     if (state.key && self.key && !equals(state.key, self.key)) {
       return cb(new Error('Another hypercore is stored here'))
@@ -840,7 +856,9 @@ Feed.prototype._verifyRootsAndWrite = function (index, data, top, proof, nodes, 
     var length = verifiedBy / 2
     if (length > self.length) {
       // TODO: only emit this after the info has been flushed to storage
+      if (self.writable) self._merkle = null // We need to reload merkle state now
       self.length = length
+      self._seq = length
       self.byteLength = roots.reduce(addSize, 0)
       if (self._synced) self._synced.seek(0, self.length)
       self.emit('append')
@@ -1002,7 +1020,7 @@ Feed.prototype.createWriteStream = function () {
   return bulk.obj(write)
 
   function write (batch, cb) {
-    self._batch(batch, cb)
+    self.append(batch, cb)
   }
 }
 
@@ -1065,11 +1083,22 @@ Feed.prototype.finalize = function (cb) {
 }
 
 Feed.prototype.append = function (batch, cb) {
-  this._batch(Array.isArray(batch) ? batch : [batch], cb || noop)
+  if (!cb) cb = noop
+
+  var self = this
+  var list = Array.isArray(batch) ? batch : [batch]
+  this._batch(list, onappend)
+
+  function onappend (err) {
+    if (err) return cb(err)
+    var seq = self._seq
+    self._seq += list.length
+    cb(null, seq)
+  }
 }
 
 Feed.prototype.flush = function (cb) {
-  this._batch([], cb)
+  this.append([], cb)
 }
 
 Feed.prototype.close = function (cb) {
@@ -1252,6 +1281,52 @@ Feed.prototype._roots = function (index, cb) {
     if (error) return cb(error)
     cb(null, result)
   }
+}
+
+Feed.prototype.audit = function (cb) {
+  if (!cb) cb = noop
+
+  var self = this
+  var report = {
+    valid: 0,
+    invalid: 0
+  }
+
+  this.ready(function (err) {
+    if (err) return cb(err)
+
+    var block = 0
+    var max = self.length
+
+    next()
+
+    function onnode (err, node) {
+      if (err) return ondata(null, null)
+      self._storage.getData(block, ondata)
+
+      function ondata (_, data) {
+        var verified = data && crypto.data(data).equals(node.hash)
+        if (verified) report.valid++
+        else report.invalid++
+        self.bitfield.set(block, verified)
+        block++
+        next()
+      }
+    }
+
+    function next () {
+      while (block < max && !self.bitfield.get(block)) block++
+      if (block >= max) return done()
+      self._storage.getNode(2 * block, onnode)
+    }
+
+    function done () {
+      self._sync(null, function (err) {
+        if (err) return cb(err)
+        cb(null, report)
+      })
+    }
+  })
 }
 
 function noop () {}
